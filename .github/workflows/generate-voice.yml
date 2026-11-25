@@ -1,0 +1,331 @@
+# voice-workflow-version: 9
+name: VoiceStudio Generate Audio
+
+run-name: VoiceStudio ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: The project ID for artifact naming
+        required: true
+        type: string
+      text:
+        description: Text to convert into speech
+        required: true
+        type: string
+      language:
+        description: Language
+        required: true
+        default: ar
+        type: string
+      voice:
+        description: Voice id
+        required: false
+        default: default
+        type: string
+      speed:
+        description: Speech speed (0.5 to 2.0)
+        required: false
+        default: "1.0"
+        type: string
+      request_id:
+        description: Unique id created by the app (used to find this run)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: "[VOICE_START] Free disk space"
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo apt-get clean
+          docker system prune -af || true
+          df -h
+
+      - name: "[VOICE_START] Create temporary API key"
+        run: |
+          KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')
+          echo "::add-mask::$KEY"
+          echo "OMNIVOICE_API_KEY=$KEY" >> "$GITHUB_ENV"
+
+      - name: "[VOICE_START] Pull VoiceStudio"
+        run: docker pull ghcr.io/debpalash/voicestudio:stable
+
+      - name: "[VOICE_START] Start VoiceStudio"
+        run: |
+          docker run -d \
+            --name voicestudio \
+            --platform linux/amd64 \
+            -p 127.0.0.1:3900:3900 \
+            -e OMNIVOICE_API_KEY="$OMNIVOICE_API_KEY" \
+            -e OMNIVOICE_SERVER_MODE=1 \
+            -e OMNIVOICE_DATA_DIR=/app/omnivoice_data \
+            -e OMNIVOICE_ANALYTICS_DISABLED=1 \
+            -e PYTHONUNBUFFERED=1 \
+            ghcr.io/debpalash/voicestudio:stable
+
+      - name: "[VOICE_START] Wait for API"
+        run: |
+          READY=0
+          for i in $(seq 1 90); do
+            CODE=$(curl -s -o /tmp/health.json -w "%{http_code}" \
+              http://127.0.0.1:3900/health \
+              -H "Authorization: Bearer $OMNIVOICE_API_KEY" || true)
+
+            if [ "$CODE" = "200" ]; then
+              READY=1
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "$READY" != "1" ]; then
+            docker logs voicestudio
+            exit 1
+          fi
+
+      - name: "[VOICE_INSTALL] Accept current model notices"
+        run: |
+          python3 - <<'PY'
+          import urllib.request, urllib.parse, json, os
+
+          base = "http://127.0.0.1:3900"
+          key = os.environ["OMNIVOICE_API_KEY"]
+
+          repos = [
+              "k2-fsa/OmniVoice",
+              "eustlb/higgs-audio-v2-tokenizer"
+          ]
+
+          def request(method, path, data=None):
+              body = json.dumps(data).encode() if data is not None else None
+              req = urllib.request.Request(
+                  base + path,
+                  data=body,
+                  method=method,
+                  headers={
+                      "Authorization": "Bearer " + key,
+                      "Content-Type": "application/json"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  raw = r.read()
+                  return json.loads(raw) if raw else {}
+
+          for repo in repos:
+              encoded = urllib.parse.quote(repo, safe="")
+              details = request(
+                  "GET",
+                  "/models/licenses/details/" + encoded
+              )
+
+              info = details.get("info", {})
+              acceptance = details.get("acceptance", {})
+              fingerprint = acceptance.get("fingerprint")
+
+              if not fingerprint:
+                  raise RuntimeError(
+                      "Missing license fingerprint for " + repo
+                  )
+
+              print("Model:", repo)
+              print("License:", info.get("license", details.get("license")))
+              print("Category:", info.get("license_category",
+                                           acceptance.get("category")))
+
+              if acceptance.get("accepted") is True:
+                  print("Already accepted.")
+                  continue
+
+              result = request(
+                  "POST",
+                  "/models/licenses/accept",
+                  {
+                      "repo_id": repo,
+                      "fingerprint": fingerprint,
+                      "accepted": True
+                  }
+              )
+
+              print("Acceptance response:", result)
+          PY
+
+      - name: "[VOICE_INSTALL] Start OmniVoice installation"
+        run: |
+          mkdir -p output
+
+          curl -fsS -X POST \
+            http://127.0.0.1:3900/models/install \
+            -H "Authorization: Bearer $OMNIVOICE_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"repo_id":"k2-fsa/OmniVoice"}' \
+            | tee output/install-response.json
+
+      - name: "[VOICE_INSTALL] Wait until model is installed"
+        run: |
+          python3 - <<'PY'
+          import urllib.request, json, os, time, sys
+
+          base = "http://127.0.0.1:3900"
+          key = os.environ["OMNIVOICE_API_KEY"]
+
+          def get(path):
+              req = urllib.request.Request(
+                  base + path,
+                  headers={"Authorization": "Bearer " + key}
+              )
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return json.loads(r.read())
+
+          for attempt in range(180):
+              models = get("/models")
+              items = models.get("models", [])
+
+              target = next(
+                  (m for m in items
+                   if m.get("repo_id") == "k2-fsa/OmniVoice"),
+                  None
+              )
+
+              if target and target.get("installed") is True:
+                  print("OmniVoice installed successfully.")
+                  sys.exit(0)
+
+              status = get("/models/install/status")
+              jobs = status.get("jobs", [])
+
+              print(
+                  "Install progress:",
+                  attempt + 1,
+                  "/180",
+                  json.dumps(jobs)[:1500]
+              )
+
+              serialized = json.dumps(status).lower()
+
+              if any(word in serialized for word in
+                     ['"status": "failed"',
+                      '"state": "failed"',
+                      '"status": "error"']):
+                  raise RuntimeError("Model installation failed.")
+
+              time.sleep(20)
+
+          raise TimeoutError("Model installation timed out.")
+          PY
+
+      - name: "[VOICE_INSTALL] Verify model"
+        run: |
+          curl -fsS \
+            http://127.0.0.1:3900/models \
+            -H "Authorization: Bearer $OMNIVOICE_API_KEY" \
+            -o output/models-after-install.json
+
+          cat output/models-after-install.json
+
+      - name: "[VOICE_GENERATE] Generate Audio"
+        env:
+          SPEECH_TEXT: ${{ inputs.text }}
+          SPEECH_LANGUAGE: ${{ inputs.language }}
+          SPEECH_VOICE: ${{ inputs.voice }}
+          SPEECH_SPEED: ${{ inputs.speed }}
+        run: |
+          python3 - <<'PY'
+          import urllib.request, json, os
+
+          text = os.environ["SPEECH_TEXT"]
+          if not text.strip():
+              raise RuntimeError("The text is empty.")
+          if len(text) > 4096:
+              raise RuntimeError("Text is longer than 4096 characters.")
+
+          voice = os.environ.get("SPEECH_VOICE") or "default"
+          
+          if voice == "female":
+              voice_desc = "female, young adult, high pitch"
+          elif voice == "male":
+              voice_desc = "male, adult, low pitch"
+          else:
+              voice_desc = "female, young adult"
+
+          try:
+              speed = float(os.environ.get("SPEECH_SPEED") or "1.0")
+          except ValueError:
+              speed = 1.0
+          speed = max(0.5, min(2.0, speed))
+
+          data = {
+              "model": "omnivoice",
+              "voice": voice,
+              "input": text,
+              "language": os.environ["SPEECH_LANGUAGE"],
+              "response_format": "wav",
+              "speed": speed,
+              "instructions": voice_desc
+          }
+
+          req = urllib.request.Request(
+              "http://127.0.0.1:3900/v1/audio/speech",
+              data=json.dumps(data).encode(),
+              headers={
+                  "Authorization":
+                      "Bearer " + os.environ["OMNIVOICE_API_KEY"],
+                  "Content-Type": "application/json"
+              },
+              method="POST"
+          )
+
+          with urllib.request.urlopen(req, timeout=1800) as response:
+              audio = response.read()
+              content_type = response.headers.get("Content-Type", "")
+
+          if not audio.startswith(b"RIFF"):
+              raise RuntimeError(
+                  "Invalid WAV response. Content-Type: " + content_type
+                  + " Response: "
+                  + audio[:1000].decode(errors="replace")
+              )
+
+          os.makedirs("output", exist_ok=True)
+
+          with open("output/VoiceStudio-Audio.wav", "wb") as f:
+              f.write(audio)
+
+          print("WAV generated successfully:", len(audio), "bytes")
+          PY
+
+      - name: "[VOICE_FINALIZE] Convert WAV to MP3"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -y -i output/VoiceStudio-Audio.wav -codec:a libmp3lame -b:a 192k output/VoiceStudio-Audio.mp3
+          ls -lh output/
+
+      - name: "[VOICE_FINALIZE] Save diagnostics"
+        if: always()
+        run: |
+          mkdir -p output
+          docker logs voicestudio > output/container.log 2>&1 || true
+          df -h > output/disk.txt
+          docker rm -f voicestudio || true
+
+      - name: "[VOICE_FINALIZE] Upload audio and diagnostics"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceStudio-Audio-${{ inputs.project_id }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7
